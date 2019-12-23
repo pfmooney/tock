@@ -12,6 +12,11 @@ use crate::plic;
 use crate::timer;
 use crate::uart;
 
+#[cfg(not(feature = "verilator"))]
+pub const CHIP_FREQ: u32 = 50_000_000;
+#[cfg(feature = "verilator")]
+pub const CHIP_FREQ: u32 = 500_000;
+
 pub struct Ibex {
     userspace_kernel_boundary: rv32i::syscall::SysCall,
 }

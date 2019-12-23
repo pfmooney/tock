@@ -40,6 +40,11 @@ static APP_HACK: u8 = 0;
 #[link_section = ".stack_buffer"]
 pub static mut STACK_MEMORY: [u8; 0x1000] = [0; 0x1000];
 
+#[cfg(not(feature = "verilator"))]
+const UART_BAUD: u32 = 230_400;
+#[cfg(feature = "verilator")]
+const UART_BAUD: u32 = 9_600;
+
 /// A structure representing this platform that holds references to all
 /// capsules for this platform. We've included an alarm and console.
 struct OpenTitan {
@@ -106,7 +111,7 @@ pub unsafe fn reset_handler() {
         MuxUart::new(
             &ibex::uart::UART0,
             &mut capsules::virtual_uart::RX_BUF,
-            230400
+            UART_BAUD
         )
     );
 
