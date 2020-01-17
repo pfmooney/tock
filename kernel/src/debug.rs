@@ -57,31 +57,22 @@ use crate::ReturnCode;
 /// Tock default panic routine.
 ///
 /// **NOTE:** The supplied `writer` must be synchronous.
-pub unsafe fn panic<L: hil::led::Led, W: Write>(
+pub unsafe fn panic<L: hil::led::Led, W: Write, F: Fn()>(
     leds: &mut [&mut L],
     writer: &mut W,
     panic_info: &PanicInfo,
-    nop: &dyn Fn(),
+    panic_quiesce: Option<F>,
     processes: &'static [Option<&'static dyn ProcessType>],
 ) -> ! {
-    panic_begin(nop);
+    if let Some(quiesce) = panic_quiesce {
+        // Hook to allow any core kernel cleanup that is needed
+        quiesce();
+    }
     panic_banner(writer, panic_info);
     // Flush debug buffer if needed
     flush(writer);
     panic_process_info(processes, writer);
     panic_blink_forever(leds)
-}
-
-/// Generic panic entry.
-///
-/// This opaque method should always be called at the beginning of a board's
-/// panic method to allow hooks for any core kernel cleanups that may be
-/// appropriate.
-pub unsafe fn panic_begin(nop: &dyn Fn()) {
-    // Let any outstanding uart DMA's finish
-    for _ in 0..200000 {
-        nop();
-    }
 }
 
 /// Lightweight prints about the current panic and kernel version.

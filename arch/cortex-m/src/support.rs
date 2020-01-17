@@ -55,3 +55,11 @@ where
 {
     unimplemented!()
 }
+
+#[cfg(all(target_arch = "arm", target_os = "none"))]
+pub fn panic_quiesce() {
+    // Let any outstanding uart DMAs finish
+    for _ in 0..200000 {
+        nop();
+    }
+}
