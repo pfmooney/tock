@@ -1,331 +1,409 @@
 //! Implementation of the physical memory protection unit (PMP).
 
 use core::cmp;
-use core::fmt;
+use core::fmt::{Display, Formatter};
+use core::iter::Take;
+use core::marker::PhantomData;
+use core::slice;
 
-use crate::csr;
-use kernel;
-use kernel::common::math;
-use kernel::common::registers::register_bitfields;
-use kernel::mpu;
+use crate::csr::CSR;
+use kernel::mpu::{Permissions, Region, MPU};
 
-// This is the RISC-V PMP support for Tock
-// We use the PMP TOR alignment as there are alignment issues with NAPOT
-// NAPOT would allow us to use more regions (each PMP region can be a
-//     memory region) but the problem with NAPOT is the address must be
-//     alignment to the size, which results in wasted memory.
-// To avoid this wasted memory we use TOR and each memory region uses two
-//     physical PMP regions.
+const CFG_PROT_READ: u8 = 1 << 0;
+const CFG_PROT_WRITE: u8 = 1 << 1;
+const CFG_PROT_EXEC: u8 = 1 << 2;
+const CFG_MODE_OFF: u8 = 0;
+const CFG_MODE_TOR: u8 = 1 << 3;
+const CFG_MODE_NA4: u8 = 2 << 3;
+const CFG_MODE_NAPOT: u8 = 3 << 3;
 
-// Generic PMP config
-register_bitfields![u32,
-    pub pmpcfg [
-        r OFFSET(0) NUMBITS(1) [],
-        w OFFSET(1) NUMBITS(1) [],
-        x OFFSET(2) NUMBITS(1) [],
-        a OFFSET(3) NUMBITS(2) [
-            OFF = 0,
-            TOR = 1,
-            NA4 = 2,
-            NAPOT = 3
-        ],
-        l OFFSET(7) NUMBITS(1) []
-    ]
-];
+/// Holds values to be stored in pmpcfg# and pmpaddr# to represent a PMP mapping
+struct PMPEntry {
+    cfg: u8,
+    addr: usize,
+}
 
-/// Struct storing configuration for a RISC-V PMP region.
-#[derive(Copy, Clone)]
+/// Describes a memory region to be represented by PMP register value(s)
+#[derive(Default, Clone, Copy)]
 pub struct PMPRegion {
-    location: Option<(*const u8, usize)>,
-    cfg: tock_registers::registers::FieldValue<u32, pmpcfg::Register>,
+    addr: usize,
+    size: usize,
+    prot: u8,
+    mode: u8,
+}
+
+fn perm_to_prot(perm: Permissions) -> u8 {
+    match perm {
+        Permissions::ReadWriteExecute => CFG_PROT_READ | CFG_PROT_WRITE | CFG_PROT_EXEC,
+        Permissions::ReadWriteOnly => CFG_PROT_READ | CFG_PROT_WRITE,
+        Permissions::ReadExecuteOnly => CFG_PROT_READ | CFG_PROT_EXEC,
+        Permissions::ReadOnly => CFG_PROT_READ,
+        Permissions::ExecuteOnly => CFG_PROT_EXEC,
+    }
+}
+
+fn layout_to_mode(addr: usize, size: usize) -> u8 {
+    if size == 4 {
+        CFG_MODE_NA4
+    } else if usize::is_power_of_two(size) && addr & (size - 1) == 0 {
+        // Are `addr` and `size` region naturally aligned to a power of two?
+        CFG_MODE_NAPOT
+    } else {
+        CFG_MODE_TOR
+    }
 }
 
 impl PMPRegion {
-    fn new(start: *const u8, size: usize, permissions: mpu::Permissions) -> PMPRegion {
-        // Determine access and execute permissions
-        let pmpcfg = match permissions {
-            mpu::Permissions::ReadWriteExecute => {
-                pmpcfg::r::SET + pmpcfg::w::SET + pmpcfg::x::SET + pmpcfg::a::TOR
-            }
-            mpu::Permissions::ReadWriteOnly => {
-                pmpcfg::r::SET + pmpcfg::w::SET + pmpcfg::x::CLEAR + pmpcfg::a::TOR
-            }
-            mpu::Permissions::ReadExecuteOnly => {
-                pmpcfg::r::SET + pmpcfg::w::CLEAR + pmpcfg::x::SET + pmpcfg::a::TOR
-            }
-            mpu::Permissions::ReadOnly => {
-                pmpcfg::r::SET + pmpcfg::w::CLEAR + pmpcfg::x::CLEAR + pmpcfg::a::TOR
-            }
-            mpu::Permissions::ExecuteOnly => {
-                pmpcfg::r::CLEAR + pmpcfg::w::CLEAR + pmpcfg::x::SET + pmpcfg::a::TOR
-            }
-        };
-
+    fn new(addr: usize, size: usize, perm: Permissions) -> Self {
         PMPRegion {
-            location: Some((start, size)),
-            cfg: pmpcfg,
+            addr,
+            size,
+            prot: perm_to_prot(perm),
+            mode: layout_to_mode(addr, size),
         }
     }
 
-    fn empty(_region_num: usize) -> PMPRegion {
-        PMPRegion {
-            location: None,
-            cfg: pmpcfg::r::CLEAR + pmpcfg::w::CLEAR + pmpcfg::x::CLEAR + pmpcfg::a::OFF,
-        }
-    }
-
-    fn location(&self) -> Option<(*const u8, usize)> {
-        self.location
-    }
-
-    fn overlaps(&self, other_start: *const u8, other_size: usize) -> bool {
-        let other_start = other_start as usize;
-        let other_end = other_start + other_size;
-
-        let (region_start, region_end) = match self.location {
-            Some((region_start, region_size)) => {
-                let region_start = region_start as usize;
-                let region_end = region_start + region_size;
-                (region_start, region_end)
-            }
-            None => return false,
-        };
-
-        if region_start < other_end && other_start < region_end {
-            true
+    fn render(&self) -> (PMPEntry, Option<PMPEntry>) {
+        if self.mode != CFG_MODE_TOR {
+            let end = self.addr | (self.size - 1);
+            (
+                PMPEntry {
+                    cfg: self.prot | self.mode,
+                    addr: end >> 2,
+                },
+                None,
+            )
         } else {
-            false
+            let bor = PMPEntry {
+                cfg: CFG_MODE_OFF,
+                addr: self.addr >> 2,
+            };
+
+            let end = self.addr + self.size - 1;
+            let tor = PMPEntry {
+                cfg: self.prot | CFG_MODE_TOR,
+                addr: end >> 2,
+            };
+
+            (bor, Some(tor))
+        }
+    }
+
+    fn needed_regs(&self) -> u8 {
+        match self.mode == CFG_MODE_TOR {
+            true => 2,
+            false => 1,
+        }
+    }
+
+    fn overlaps(&self, other: &Self) -> bool {
+        let other_addr = other.addr;
+        let other_end = other.addr + other.size;
+
+        if other_addr <= self.addr {
+            other_end > self.addr
+        } else {
+            other_addr < (self.addr + self.size)
+        }
+    }
+
+    fn set_perm(&mut self, perm: Permissions) {
+        self.prot = perm_to_prot(perm);
+    }
+}
+
+struct PMPConfig<'a> {
+    regions: &'a mut [PMPRegion],
+    nregions: &'a mut u8,
+    max_cfg_registers: u8,
+}
+
+impl PMPConfig<'a> {
+    pub fn new<'b>(
+        regions: &'b mut [PMPRegion],
+        nregions: &'b mut u8,
+        max_cfg_registers: u8,
+    ) -> Self
+    where
+        'b: 'a,
+    {
+        // TODO: validate slice length
+        Self {
+            regions,
+            nregions,
+            max_cfg_registers,
+        }
+    }
+
+    pub fn render_iter<'b>(regions: &'b [PMPRegion], nregions: u8) -> Iter<'b> {
+        Iter {
+            region_iter: regions.iter().take(nregions as usize),
+            tor: None,
+        }
+    }
+
+    pub fn map(&mut self, addr: usize, size: usize, perm: Permissions) -> Option<()> {
+        let new_region = PMPRegion::new(addr, size, perm);
+        self.append(&new_region)
+    }
+
+    pub fn resize(&mut self, addr: usize, new_size: usize) -> Option<()> {
+        let mut old_region = self.remove(addr)?;
+        let old_size = old_region.size;
+        old_region.size = new_size;
+        if self.append(&old_region).is_none() {
+            old_region.size = old_size;
+            let undo = self.append(&old_region);
+            assert!(undo.is_some());
+            None
+        } else {
+            Some(())
+        }
+    }
+
+    pub fn set_perm(&mut self, addr: usize, new_perm: Permissions) -> Option<()> {
+        let ent = self.regions[0..*self.nregions as usize]
+            .iter_mut()
+            .find(|e| e.addr == addr)?;
+        ent.set_perm(new_perm);
+        Some(())
+    }
+
+    fn remove(&mut self, addr: usize) -> Option<PMPRegion> {
+        let remove_idx = self
+            .regions
+            .iter()
+            .take(*self.nregions as usize)
+            .position(|e| e.addr == addr)?;
+        *self.nregions -= 1;
+        if remove_idx as u8 == *self.nregions {
+            // Removing the tail is easy.
+            // Decrementing `nregions` just shaved it off.
+            Some(self.regions[remove_idx])
+        } else {
+            let res: PMPRegion = self.regions[remove_idx];
+            // Copy the old tail into the newly made "hole"
+            self.regions[remove_idx] = self.regions[*self.nregions as usize];
+            Some(res)
+        }
+    }
+
+    fn append(&mut self, new_region: &PMPRegion) -> Option<()> {
+        if *self.nregions >= self.max_cfg_registers {
+            return None;
+        }
+
+        // Ensure the new region does not overlap with any existing ones and will not push the
+        // config over its pmpcfg register budget.
+        let mut nregs = 0;
+        for r in self.regions.iter().take(*self.nregions as usize) {
+            if r.overlaps(new_region) {
+                return None;
+            }
+            nregs += r.needed_regs();
+        }
+        if nregs + new_region.needed_regs() > self.max_cfg_registers {
+            return None;
+        }
+
+        self.regions[*self.nregions as usize] = *new_region;
+        *self.nregions += 1;
+        Some(())
+    }
+}
+
+struct Iter<'a> {
+    region_iter: Take<slice::Iter<'a, PMPRegion>>,
+    tor: Option<PMPEntry>,
+}
+
+impl<'a> Iterator for Iter<'a> {
+    type Item = PMPEntry;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let tor = self.tor.take();
+        if tor.is_none() {
+            match self.region_iter.next() {
+                Some(region) => {
+                    let (res, tor) = region.render();
+                    self.tor = tor;
+                    Some(res)
+                }
+                None => None,
+            }
+        } else {
+            tor
         }
     }
 }
 
-/// Struct storing region configuration for RISCV PMP.
-#[derive(Copy, Clone)]
-pub struct PMPConfig {
-    regions: [PMPRegion; 8],
-    total_regions: usize,
+/// Config implementation for fully capable (16 entry, 4-byte granularity) MPU
+#[derive(Default)]
+pub struct FullMPUConfig {
+    regions: [PMPRegion; 16],
+    nregions: u8,
+    app_region: Option<(usize, usize)>,
 }
 
-const APP_MEMORY_REGION_NUM: usize = 0;
-
-impl Default for PMPConfig {
-    /// number of regions on the arty chip
-    fn default() -> PMPConfig {
-        PMPConfig {
-            regions: [
-                PMPRegion::empty(0),
-                PMPRegion::empty(1),
-                PMPRegion::empty(2),
-                PMPRegion::empty(3),
-                PMPRegion::empty(4),
-                PMPRegion::empty(5),
-                PMPRegion::empty(6),
-                PMPRegion::empty(7),
-            ],
-            total_regions: 8,
-        }
-    }
-}
-
-impl fmt::Display for PMPConfig {
-    fn fmt(&self, _f: &mut fmt::Formatter<'_>) -> fmt::Result {
+impl Display for FullMPUConfig {
+    fn fmt(&self, _f: &mut Formatter) -> core::fmt::Result {
         Ok(())
     }
 }
 
-impl PMPConfig {
-    pub fn new(pmp_regions: usize) -> PMPConfig {
-        if pmp_regions > 16 {
-            panic!("There is an ISA maximum of 16 PMP regions");
-        }
-        if pmp_regions < 4 {
-            panic!("Tock requires at least 4 PMP regions");
-        }
-        PMPConfig {
-            regions: [
-                PMPRegion::empty(0),
-                PMPRegion::empty(1),
-                PMPRegion::empty(2),
-                PMPRegion::empty(3),
-                PMPRegion::empty(4),
-                PMPRegion::empty(5),
-                PMPRegion::empty(6),
-                PMPRegion::empty(7),
-            ],
-            // As we use the PMP TOR setup we only support half the number
-            // of regions as hardware supports
-            total_regions: pmp_regions / 2,
+impl RiscvMPUConfig for FullMPUConfig {
+    fn state<'a>(&'a self) -> (&'a [PMPRegion], u8) {
+        (&self.regions, self.nregions)
+    }
+    fn state_mut<'a>(&'a mut self) -> (&'a mut [PMPRegion], &'a mut u8) {
+        (&mut self.regions, &mut self.nregions)
+    }
+
+    fn set_app_region(&mut self, addr: usize, size: usize) -> Option<()> {
+        if self.app_region.is_some() {
+            None
+        } else {
+            self.app_region = Some((addr, size));
+            Some(())
         }
     }
 
-    fn unused_region_number(&self) -> Option<usize> {
-        for (number, region) in self.regions.iter().enumerate() {
-            if number == APP_MEMORY_REGION_NUM {
-                continue;
-            }
-            if let None = region.location() {
-                if number < self.total_regions {
-                    return Some(number);
-                }
-            }
-        }
-        None
+    fn get_app_region(&self) -> Option<(usize, usize)> {
+        self.app_region
+    }
+
+    fn apply(&self) {
+        let mut cfgs = [0u32; 4];
+        let mut addrs = [0u32; 16];
+
+        self.render(&mut cfgs, &mut addrs);
+        CSR.pmpcfg0.set(cfgs[0]);
+        CSR.pmpcfg1.set(cfgs[1]);
+        CSR.pmpcfg2.set(cfgs[2]);
+        CSR.pmpcfg3.set(cfgs[3]);
+        CSR.pmpaddr0.set(addrs[0]);
+        CSR.pmpaddr1.set(addrs[1]);
+        CSR.pmpaddr2.set(addrs[2]);
+        CSR.pmpaddr3.set(addrs[3]);
+        CSR.pmpaddr4.set(addrs[4]);
+        CSR.pmpaddr5.set(addrs[5]);
+        CSR.pmpaddr6.set(addrs[6]);
+        CSR.pmpaddr7.set(addrs[7]);
+        CSR.pmpaddr8.set(addrs[8]);
+        CSR.pmpaddr9.set(addrs[9]);
+        CSR.pmpaddr10.set(addrs[10]);
+        CSR.pmpaddr11.set(addrs[11]);
+        CSR.pmpaddr12.set(addrs[12]);
+        CSR.pmpaddr13.set(addrs[13]);
+        CSR.pmpaddr14.set(addrs[14]);
+        CSR.pmpaddr15.set(addrs[15]);
+    }
+
+    fn max_regions() -> u8 {
+        16u8
+    }
+    fn granularity() -> usize {
+        4usize
     }
 }
 
-impl kernel::mpu::MPU for PMPConfig {
-    type MpuConfig = PMPConfig;
+pub trait RiscvMPUConfig {
+    fn set_app_region(&mut self, addr: usize, size: usize) -> Option<()>;
+    fn get_app_region(&self) -> Option<(usize, usize)>;
+    fn apply(&self);
+    fn max_regions() -> u8;
+    fn granularity() -> usize;
 
-    fn enable_mpu(&self) {}
+    fn state<'a>(&'a self) -> (&'a [PMPRegion], u8);
+    fn state_mut<'a>(&'a mut self) -> (&'a mut [PMPRegion], &'a mut u8);
+
+    fn map(&mut self, addr: usize, size: usize, perm: Permissions) -> Option<()> {
+        Self::valid_mapping(addr, size)?;
+
+        let (regions, nregions) = self.state_mut();
+        let mut cfg = PMPConfig::new(regions, nregions, Self::max_regions());
+        cfg.map(addr, size, perm)
+    }
+
+    fn resize(&mut self, addr: usize, new_size: usize) -> Option<()> {
+        Self::valid_mapping(addr, new_size)?;
+
+        let (regions, nregions) = self.state_mut();
+        let mut cfg = PMPConfig::new(regions, nregions, Self::max_regions());
+        cfg.resize(addr, new_size)
+    }
+
+    fn set_perm(&mut self, addr: usize, perm: Permissions) -> Option<()> {
+        let (regions, nregions) = self.state_mut();
+        let mut cfg = PMPConfig::new(regions, nregions, Self::max_regions());
+        cfg.set_perm(addr, perm)
+    }
+
+    fn render(&self, cfgs: &mut [u32], addrs: &mut [u32]) {
+        let (regions, nregions) = self.state();
+        let iter = PMPConfig::render_iter(regions, nregions);
+        for (idx, entry) in iter.enumerate() {
+            let cfg_reg = idx / 4; /* 0-3 -> pmpcfg0-pmpcfg3 */
+            let cfg_field = idx % 4; /* fields 0-3 in pmpcfg# */
+            let cfg_shift = cfg_field * 8;
+
+            cfgs[cfg_reg] |= u32::from(entry.cfg) << cfg_shift;
+            addrs[idx] = entry.addr as u32;
+        }
+    }
+
+    fn valid_mapping(size: usize, addr: usize) -> Option<()> {
+        let end = addr.checked_add(size)?;
+        let granularity = Self::granularity();
+        debug_assert!(usize::is_power_of_two(granularity));
+        let mask = granularity - 1;
+
+        if size == 0 || addr & mask != 0 || end & mask != 0 {
+            None
+        } else {
+            Some(())
+        }
+    }
+
+    fn round_to_granularity(addr: usize) -> usize {
+        let granularity = Self::granularity();
+        debug_assert!(usize::is_power_of_two(granularity));
+        let mask = granularity - 1;
+        (addr + mask) & !mask
+    }
+}
+
+pub struct RiscvMPU<T> {
+    phantom: PhantomData<T>,
+}
+
+impl<T> RiscvMPU<T>
+where
+    T: RiscvMPUConfig + Display + Default,
+{
+    pub fn new() -> Self {
+        Self {
+            phantom: PhantomData,
+        }
+    }
+}
+
+impl<T> MPU for RiscvMPU<T>
+where
+    T: RiscvMPUConfig + Display + Default,
+{
+    type MpuConfig = T;
+
+    fn enable_mpu(&self) {
+        // PMP enforcement is enabled on entry to U-mode
+    }
 
     fn disable_mpu(&self) {
-        for x in 0..16 {
-            // If PMP is supported by the core then all 16 register sets must exist
-            // They don't all have to do anything, but let's zero them all just in case.
-            match x {
-                0 => {
-                    csr::CSR.pmpcfg0.modify(csr::pmpconfig::pmpcfg::r0::CLEAR);
-                    csr::CSR.pmpcfg0.modify(csr::pmpconfig::pmpcfg::w0::CLEAR);
-                    csr::CSR.pmpcfg0.modify(csr::pmpconfig::pmpcfg::x0::CLEAR);
-                    csr::CSR.pmpcfg0.modify(csr::pmpconfig::pmpcfg::a0::OFF);
-                    csr::CSR.pmpcfg0.modify(csr::pmpconfig::pmpcfg::l0::CLEAR);
-                    csr::CSR.pmpaddr0.set(0x0);
-                }
-                1 => {
-                    csr::CSR.pmpcfg0.modify(csr::pmpconfig::pmpcfg::r1::CLEAR);
-                    csr::CSR.pmpcfg0.modify(csr::pmpconfig::pmpcfg::w1::CLEAR);
-                    csr::CSR.pmpcfg0.modify(csr::pmpconfig::pmpcfg::x1::CLEAR);
-                    csr::CSR.pmpcfg0.modify(csr::pmpconfig::pmpcfg::a1::OFF);
-                    csr::CSR.pmpcfg0.modify(csr::pmpconfig::pmpcfg::l1::CLEAR);
-                    csr::CSR.pmpaddr1.set(0x0);
-                }
-                2 => {
-                    csr::CSR.pmpcfg0.modify(csr::pmpconfig::pmpcfg::r2::CLEAR);
-                    csr::CSR.pmpcfg0.modify(csr::pmpconfig::pmpcfg::w2::CLEAR);
-                    csr::CSR.pmpcfg0.modify(csr::pmpconfig::pmpcfg::x2::CLEAR);
-                    csr::CSR.pmpcfg0.modify(csr::pmpconfig::pmpcfg::a2::OFF);
-                    csr::CSR.pmpcfg0.modify(csr::pmpconfig::pmpcfg::l2::CLEAR);
-                    csr::CSR.pmpaddr2.set(0x0);
-                }
-                3 => {
-                    csr::CSR.pmpcfg0.modify(csr::pmpconfig::pmpcfg::r3::CLEAR);
-                    csr::CSR.pmpcfg0.modify(csr::pmpconfig::pmpcfg::w3::CLEAR);
-                    csr::CSR.pmpcfg0.modify(csr::pmpconfig::pmpcfg::x3::CLEAR);
-                    csr::CSR.pmpcfg0.modify(csr::pmpconfig::pmpcfg::a3::OFF);
-                    csr::CSR.pmpcfg0.modify(csr::pmpconfig::pmpcfg::l3::CLEAR);
-                    csr::CSR.pmpaddr3.set(0x0);
-                }
-                4 => {
-                    csr::CSR.pmpcfg1.modify(csr::pmpconfig::pmpcfg::r0::CLEAR);
-                    csr::CSR.pmpcfg1.modify(csr::pmpconfig::pmpcfg::w0::CLEAR);
-                    csr::CSR.pmpcfg1.modify(csr::pmpconfig::pmpcfg::x0::CLEAR);
-                    csr::CSR.pmpcfg1.modify(csr::pmpconfig::pmpcfg::a0::OFF);
-                    csr::CSR.pmpcfg1.modify(csr::pmpconfig::pmpcfg::l0::CLEAR);
-                    csr::CSR.pmpaddr4.set(0x0);
-                }
-                5 => {
-                    csr::CSR.pmpcfg1.modify(csr::pmpconfig::pmpcfg::r1::CLEAR);
-                    csr::CSR.pmpcfg1.modify(csr::pmpconfig::pmpcfg::w1::CLEAR);
-                    csr::CSR.pmpcfg1.modify(csr::pmpconfig::pmpcfg::x1::CLEAR);
-                    csr::CSR.pmpcfg1.modify(csr::pmpconfig::pmpcfg::a1::OFF);
-                    csr::CSR.pmpcfg1.modify(csr::pmpconfig::pmpcfg::l1::CLEAR);
-                    csr::CSR.pmpaddr5.set(0x0);
-                }
-                6 => {
-                    csr::CSR.pmpcfg1.modify(csr::pmpconfig::pmpcfg::r2::CLEAR);
-                    csr::CSR.pmpcfg1.modify(csr::pmpconfig::pmpcfg::w2::CLEAR);
-                    csr::CSR.pmpcfg1.modify(csr::pmpconfig::pmpcfg::x2::CLEAR);
-                    csr::CSR.pmpcfg1.modify(csr::pmpconfig::pmpcfg::a2::OFF);
-                    csr::CSR.pmpcfg1.modify(csr::pmpconfig::pmpcfg::l2::CLEAR);
-                    csr::CSR.pmpaddr6.set(0x0);
-                }
-                7 => {
-                    csr::CSR.pmpcfg1.modify(csr::pmpconfig::pmpcfg::r3::CLEAR);
-                    csr::CSR.pmpcfg1.modify(csr::pmpconfig::pmpcfg::w3::CLEAR);
-                    csr::CSR.pmpcfg1.modify(csr::pmpconfig::pmpcfg::x3::CLEAR);
-                    csr::CSR.pmpcfg1.modify(csr::pmpconfig::pmpcfg::a3::OFF);
-                    csr::CSR.pmpcfg1.modify(csr::pmpconfig::pmpcfg::l3::CLEAR);
-                    csr::CSR.pmpaddr7.set(0x0);
-                }
-                8 => {
-                    csr::CSR.pmpcfg2.modify(csr::pmpconfig::pmpcfg::r0::CLEAR);
-                    csr::CSR.pmpcfg2.modify(csr::pmpconfig::pmpcfg::w0::CLEAR);
-                    csr::CSR.pmpcfg2.modify(csr::pmpconfig::pmpcfg::x0::CLEAR);
-                    csr::CSR.pmpcfg2.modify(csr::pmpconfig::pmpcfg::a0::OFF);
-                    csr::CSR.pmpcfg2.modify(csr::pmpconfig::pmpcfg::l0::CLEAR);
-                    csr::CSR.pmpaddr8.set(0x0);
-                }
-                9 => {
-                    csr::CSR.pmpcfg2.modify(csr::pmpconfig::pmpcfg::r1::CLEAR);
-                    csr::CSR.pmpcfg2.modify(csr::pmpconfig::pmpcfg::w1::CLEAR);
-                    csr::CSR.pmpcfg2.modify(csr::pmpconfig::pmpcfg::x1::CLEAR);
-                    csr::CSR.pmpcfg2.modify(csr::pmpconfig::pmpcfg::a1::OFF);
-                    csr::CSR.pmpcfg2.modify(csr::pmpconfig::pmpcfg::l1::CLEAR);
-                    csr::CSR.pmpaddr9.set(0x0);
-                }
-                10 => {
-                    csr::CSR.pmpcfg2.modify(csr::pmpconfig::pmpcfg::r2::CLEAR);
-                    csr::CSR.pmpcfg2.modify(csr::pmpconfig::pmpcfg::w2::CLEAR);
-                    csr::CSR.pmpcfg2.modify(csr::pmpconfig::pmpcfg::x2::CLEAR);
-                    csr::CSR.pmpcfg2.modify(csr::pmpconfig::pmpcfg::a2::OFF);
-                    csr::CSR.pmpcfg2.modify(csr::pmpconfig::pmpcfg::l2::CLEAR);
-                    csr::CSR.pmpaddr10.set(0x0);
-                }
-                11 => {
-                    csr::CSR.pmpcfg2.modify(csr::pmpconfig::pmpcfg::r3::CLEAR);
-                    csr::CSR.pmpcfg2.modify(csr::pmpconfig::pmpcfg::w3::CLEAR);
-                    csr::CSR.pmpcfg2.modify(csr::pmpconfig::pmpcfg::x3::CLEAR);
-                    csr::CSR.pmpcfg2.modify(csr::pmpconfig::pmpcfg::a3::OFF);
-                    csr::CSR.pmpcfg2.modify(csr::pmpconfig::pmpcfg::l3::CLEAR);
-                    csr::CSR.pmpaddr11.set(0x0);
-                }
-                12 => {
-                    csr::CSR.pmpcfg3.modify(csr::pmpconfig::pmpcfg::r0::CLEAR);
-                    csr::CSR.pmpcfg3.modify(csr::pmpconfig::pmpcfg::w0::CLEAR);
-                    csr::CSR.pmpcfg3.modify(csr::pmpconfig::pmpcfg::x0::CLEAR);
-                    csr::CSR.pmpcfg3.modify(csr::pmpconfig::pmpcfg::a0::OFF);
-                    csr::CSR.pmpcfg3.modify(csr::pmpconfig::pmpcfg::l0::CLEAR);
-                    csr::CSR.pmpaddr12.set(0x0);
-                }
-                13 => {
-                    csr::CSR.pmpcfg3.modify(csr::pmpconfig::pmpcfg::r1::CLEAR);
-                    csr::CSR.pmpcfg3.modify(csr::pmpconfig::pmpcfg::w1::CLEAR);
-                    csr::CSR.pmpcfg3.modify(csr::pmpconfig::pmpcfg::x1::CLEAR);
-                    csr::CSR.pmpcfg3.modify(csr::pmpconfig::pmpcfg::a1::OFF);
-                    csr::CSR.pmpcfg3.modify(csr::pmpconfig::pmpcfg::l1::CLEAR);
-                    csr::CSR.pmpaddr13.set(0x0);
-                }
-                14 => {
-                    csr::CSR.pmpcfg3.modify(csr::pmpconfig::pmpcfg::r2::CLEAR);
-                    csr::CSR.pmpcfg3.modify(csr::pmpconfig::pmpcfg::w2::CLEAR);
-                    csr::CSR.pmpcfg3.modify(csr::pmpconfig::pmpcfg::x2::CLEAR);
-                    csr::CSR.pmpcfg3.modify(csr::pmpconfig::pmpcfg::a2::OFF);
-                    csr::CSR.pmpcfg3.modify(csr::pmpconfig::pmpcfg::l2::CLEAR);
-                    csr::CSR.pmpaddr14.set(0x0);
-                }
-                15 => {
-                    csr::CSR.pmpcfg3.modify(csr::pmpconfig::pmpcfg::r3::CLEAR);
-                    csr::CSR.pmpcfg3.modify(csr::pmpconfig::pmpcfg::w3::CLEAR);
-                    csr::CSR.pmpcfg3.modify(csr::pmpconfig::pmpcfg::x3::CLEAR);
-                    csr::CSR.pmpcfg3.modify(csr::pmpconfig::pmpcfg::a3::OFF);
-                    csr::CSR.pmpcfg3.modify(csr::pmpconfig::pmpcfg::l3::CLEAR);
-                    csr::CSR.pmpaddr15.set(0x0);
-                }
-                // spec 1.10 only goes to 15
-                _ => break,
-            }
-        }
-        //set first PMP to have permissions to entire space
-        csr::CSR.pmpaddr0.set(0xFFFF_FFFF);
-        //enable R W X fields
-        csr::CSR.pmpcfg0.modify(csr::pmpconfig::pmpcfg::r0::SET);
-        csr::CSR.pmpcfg0.modify(csr::pmpconfig::pmpcfg::w0::SET);
-        csr::CSR.pmpcfg0.modify(csr::pmpconfig::pmpcfg::x0::SET);
-        csr::CSR.pmpcfg0.modify(csr::pmpconfig::pmpcfg::a0::TOR)
+        // PMP enforcement is disabled on entry to M-mode
     }
 
     fn number_total_regions(&self) -> usize {
-        self.total_regions
+        Self::MpuConfig::max_regions() as usize
     }
 
     fn allocate_region(
@@ -333,44 +411,23 @@ impl kernel::mpu::MPU for PMPConfig {
         unallocated_memory_start: *const u8,
         unallocated_memory_size: usize,
         min_region_size: usize,
-        permissions: mpu::Permissions,
+        permissions: Permissions,
         config: &mut Self::MpuConfig,
-    ) -> Option<mpu::Region> {
-        for region in config.regions.iter() {
-            if region.overlaps(unallocated_memory_start, unallocated_memory_size) {
-                return None;
+    ) -> Option<Region> {
+        if unallocated_memory_size == min_region_size {
+            let addr = unallocated_memory_start as usize;
+            let size = min_region_size;
+
+            // no choice about placement since the size is exact
+            if config.map(addr, size, permissions).is_some() {
+                return Some(Region::new(addr as *const u8, size));
+            } else {
+                None
             }
+        } else {
+            // TODO: do better alignment?
+            None
         }
-
-        let region_num = config.unused_region_number()?;
-
-        // Logical region
-        let mut start = unallocated_memory_start as usize;
-        let mut size = min_region_size;
-
-        // Region start always has to align to 4 bytes
-        if start % 4 != 0 {
-            start += 4 - (start % 4);
-        }
-
-        // RISC-V PMP is not inclusive of the final address, while Tock is, increase the size by 1
-        size += 1;
-
-        // Region size always has to align to 4 bytes
-        if size % 4 != 0 {
-            size += 4 - (size % 4);
-        }
-
-        // Regions must be at least 8 bytes
-        if size < 8 {
-            size = 8;
-        }
-
-        let region = PMPRegion::new(start as *const u8, size, permissions);
-
-        config.regions[region_num] = region;
-
-        Some(mpu::Region::new(start as *const u8, size))
     }
 
     fn allocate_app_memory_region(
@@ -380,202 +437,66 @@ impl kernel::mpu::MPU for PMPConfig {
         min_memory_size: usize,
         initial_app_memory_size: usize,
         initial_kernel_memory_size: usize,
-        permissions: mpu::Permissions,
+        permissions: Permissions,
         config: &mut Self::MpuConfig,
     ) -> Option<(*const u8, usize)> {
-        // Check that no previously allocated regions overlap the unallocated memory.
-        for region in config.regions.iter() {
-            if region.overlaps(unallocated_memory_start, unallocated_memory_size) {
-                return None;
-            }
-        }
-
-        // Make sure there is enough memory for app memory and kernel memory.
-        let memory_size = cmp::max(
-            min_memory_size,
-            initial_app_memory_size + initial_kernel_memory_size,
-        );
-
-        let mut region_size =
-            math::PowerOfTwo::ceiling(memory_size as u32).as_num::<u32>() as usize;
-
-        // RISC-V PMP is not inclusive of the final address, while Tock is, increase the memory_size by 1
-        region_size += 1;
-
-        // Region size always has to align to 4 bytes
-        if region_size % 4 != 0 {
-            region_size += 4 - (region_size % 4);
-        }
-
-        // The region should start as close as possible to the start of the unallocated memory.
-        let region_start = unallocated_memory_start as usize;
-
-        // Make sure the region fits in the unallocated memory.
-        if region_start + region_size
-            > (unallocated_memory_start as usize) + unallocated_memory_size
-        {
+        if config.get_app_region().is_some() {
+            // app region already exists
             return None;
         }
+        // XXX: better overflow handling
+        let base_addr = unallocated_memory_start as usize;
+        // ensure that the region is properly aligned
+        let start_addr = Self::MpuConfig::round_to_granularity(base_addr);
 
-        let region = PMPRegion::new(region_start as *const u8, region_size, permissions);
+        // Make sure there is enough memory for app memory and kernel memory.
+        let memory_size = Self::MpuConfig::round_to_granularity(cmp::max(
+            min_memory_size,
+            initial_app_memory_size + initial_kernel_memory_size,
+        ));
 
-        config.regions[APP_MEMORY_REGION_NUM] = region;
+        let end_addr = start_addr + memory_size;
+        let padded_size = base_addr - end_addr;
 
-        Some((region_start as *const u8, region_size))
+        if padded_size > unallocated_memory_size {
+            return None;
+        }
+        if config.map(start_addr, memory_size, permissions).is_some() {
+            assert!(config.set_app_region(start_addr, memory_size).is_some());
+            Some((start_addr as *const u8, memory_size))
+        } else {
+            None
+        }
     }
 
     fn update_app_memory_region(
         &self,
         app_memory_break: *const u8,
         kernel_memory_break: *const u8,
-        permissions: mpu::Permissions,
+        permissions: Permissions,
         config: &mut Self::MpuConfig,
     ) -> Result<(), ()> {
-        let (region_start, region_size) = match config.regions[APP_MEMORY_REGION_NUM].location() {
-            Some((start, size)) => (start as usize, size),
-            None => {
-                // Error: Process tried to update app memory MPU region before it was created.
-                return Err(());
-            }
-        };
+        let app_brk = app_memory_break as usize;
+        let kernel_brk = kernel_memory_break as usize;
+        let (app_base, app_size) = config.get_app_region().ok_or(())?;
 
-        let app_memory_break = app_memory_break as usize;
-        let kernel_memory_break = kernel_memory_break as usize;
-
-        // Out of memory
-        if app_memory_break > kernel_memory_break {
+        // Do not allow any of the following conditions
+        // 1. App heap shrinking beyond nothing
+        // 2. App heap extending into kernel grant space
+        // 3. Kernel grant space shrinking beyond nothing
+        if app_brk < app_base || app_brk > kernel_brk || kernel_brk > app_base + app_size {
             return Err(());
         }
 
-        let region = PMPRegion::new(region_start as *const u8, region_size, permissions);
-
-        config.regions[APP_MEMORY_REGION_NUM] = region;
-
-        Ok(())
+        if config.resize(app_base, app_brk - app_base).is_some() {
+            let _ = config.set_perm(app_base, permissions);
+            Ok(())
+        } else {
+            Err(())
+        }
     }
 
     fn configure_mpu(&self, config: &Self::MpuConfig) {
-        let mut regions_sorted = config.regions.clone();
-        regions_sorted.sort_unstable_by(|a, b| {
-            let (a_start, _a_size) = match a.location() {
-                Some((start, size)) => (start as usize, size),
-                None => (0xFFFF_FFFF, 0xFFFF_FFFF),
-            };
-            let (b_start, _b_size) = match b.location() {
-                Some((start, size)) => (start as usize, size),
-                None => (0xFFFF_FFFF, 0xFFFF_FFFF),
-            };
-            a_start.cmp(&b_start)
-        });
-
-        for x in 0..self.total_regions {
-            let region = regions_sorted[x];
-            match region.location() {
-                Some((start, size)) => {
-                    let cfg_val = region.cfg.value;
-
-                    match x {
-                        0 => {
-                            // Disable access up to the start address
-                            csr::CSR.pmpcfg0.modify(csr::pmpconfig::pmpcfg::r0::CLEAR);
-                            csr::CSR.pmpcfg0.modify(csr::pmpconfig::pmpcfg::w0::CLEAR);
-                            csr::CSR.pmpcfg0.modify(csr::pmpconfig::pmpcfg::x0::CLEAR);
-                            csr::CSR.pmpcfg0.modify(csr::pmpconfig::pmpcfg::a0::TOR);
-                            csr::CSR.pmpaddr0.set((start as u32) >> 2);
-
-                            // Set access to end address
-                            csr::CSR.pmpcfg0.set(cfg_val << 8 | csr::CSR.pmpcfg0.get());
-                            csr::CSR.pmpaddr1.set((start as u32 + size as u32) >> 2);
-                        }
-                        1 => {
-                            // Disable access up to the start address
-                            csr::CSR.pmpcfg0.modify(csr::pmpconfig::pmpcfg::r2::CLEAR);
-                            csr::CSR.pmpcfg0.modify(csr::pmpconfig::pmpcfg::w2::CLEAR);
-                            csr::CSR.pmpcfg0.modify(csr::pmpconfig::pmpcfg::x2::CLEAR);
-                            csr::CSR.pmpcfg0.modify(csr::pmpconfig::pmpcfg::a2::TOR);
-                            csr::CSR.pmpaddr2.set((start as u32) >> 2);
-
-                            // Set access to end address
-                            csr::CSR.pmpcfg0.set(cfg_val << 24 | csr::CSR.pmpcfg0.get());
-                            csr::CSR.pmpaddr3.set((start as u32 + size as u32) >> 2);
-                        }
-                        2 => {
-                            // Disable access up to the start address
-                            csr::CSR.pmpcfg1.modify(csr::pmpconfig::pmpcfg::r0::CLEAR);
-                            csr::CSR.pmpcfg1.modify(csr::pmpconfig::pmpcfg::w0::CLEAR);
-                            csr::CSR.pmpcfg1.modify(csr::pmpconfig::pmpcfg::x0::CLEAR);
-                            csr::CSR.pmpcfg1.modify(csr::pmpconfig::pmpcfg::a0::TOR);
-                            csr::CSR.pmpaddr4.set((start as u32) >> 2);
-
-                            // Set access to end address
-                            csr::CSR.pmpcfg1.set(cfg_val << 8 | csr::CSR.pmpcfg0.get());
-                            csr::CSR.pmpaddr5.set((start as u32 + size as u32) >> 2);
-                        }
-                        3 => {
-                            // Disable access up to the start address
-                            csr::CSR.pmpcfg1.modify(csr::pmpconfig::pmpcfg::r3::CLEAR);
-                            csr::CSR.pmpcfg1.modify(csr::pmpconfig::pmpcfg::w3::CLEAR);
-                            csr::CSR.pmpcfg1.modify(csr::pmpconfig::pmpcfg::x3::CLEAR);
-                            csr::CSR.pmpcfg1.modify(csr::pmpconfig::pmpcfg::a3::TOR);
-                            csr::CSR.pmpaddr6.set((start as u32) >> 2);
-
-                            // Set access to end address
-                            csr::CSR.pmpcfg1.set(cfg_val << 24 | csr::CSR.pmpcfg0.get());
-                            csr::CSR.pmpaddr7.set((start as u32 + size as u32) >> 2);
-                        }
-                        4 => {
-                            // Disable access up to the start address
-                            csr::CSR.pmpcfg2.modify(csr::pmpconfig::pmpcfg::r0::CLEAR);
-                            csr::CSR.pmpcfg2.modify(csr::pmpconfig::pmpcfg::w0::CLEAR);
-                            csr::CSR.pmpcfg2.modify(csr::pmpconfig::pmpcfg::x0::CLEAR);
-                            csr::CSR.pmpcfg2.modify(csr::pmpconfig::pmpcfg::a0::TOR);
-                            csr::CSR.pmpaddr8.set((start as u32) >> 2);
-
-                            // Set access to end address
-                            csr::CSR.pmpcfg2.set(cfg_val << 8 | csr::CSR.pmpcfg0.get());
-                            csr::CSR.pmpaddr9.set((start as u32 + size as u32) >> 2);
-                        }
-                        5 => {
-                            // Disable access up to the start address
-                            csr::CSR.pmpcfg2.modify(csr::pmpconfig::pmpcfg::r3::CLEAR);
-                            csr::CSR.pmpcfg2.modify(csr::pmpconfig::pmpcfg::w3::CLEAR);
-                            csr::CSR.pmpcfg2.modify(csr::pmpconfig::pmpcfg::x3::CLEAR);
-                            csr::CSR.pmpcfg2.modify(csr::pmpconfig::pmpcfg::a3::TOR);
-                            csr::CSR.pmpaddr10.set((start as u32) >> 2);
-
-                            // Set access to end address
-                            csr::CSR.pmpcfg2.set(cfg_val << 24 | csr::CSR.pmpcfg0.get());
-                            csr::CSR.pmpaddr11.set((start as u32 + size as u32) >> 2);
-                        }
-                        6 => {
-                            // Disable access up to the start address
-                            csr::CSR.pmpcfg3.modify(csr::pmpconfig::pmpcfg::r0::CLEAR);
-                            csr::CSR.pmpcfg3.modify(csr::pmpconfig::pmpcfg::w0::CLEAR);
-                            csr::CSR.pmpcfg3.modify(csr::pmpconfig::pmpcfg::x0::CLEAR);
-                            csr::CSR.pmpcfg3.modify(csr::pmpconfig::pmpcfg::a0::TOR);
-                            csr::CSR.pmpaddr12.set((start as u32) >> 2);
-
-                            // Set access to end address
-                            csr::CSR.pmpcfg3.set(cfg_val << 8 | csr::CSR.pmpcfg0.get());
-                            csr::CSR.pmpaddr13.set((start as u32 + size as u32) >> 2);
-                        }
-                        7 => {
-                            // Disable access up to the start address
-                            csr::CSR.pmpcfg3.modify(csr::pmpconfig::pmpcfg::r3::CLEAR);
-                            csr::CSR.pmpcfg3.modify(csr::pmpconfig::pmpcfg::w3::CLEAR);
-                            csr::CSR.pmpcfg3.modify(csr::pmpconfig::pmpcfg::x3::CLEAR);
-                            csr::CSR.pmpcfg3.modify(csr::pmpconfig::pmpcfg::a3::TOR);
-                            csr::CSR.pmpaddr14.set((start as u32) >> 2);
-
-                            // Set access to end address
-                            csr::CSR.pmpcfg3.set(cfg_val << 24 | csr::CSR.pmpcfg0.get());
-                            csr::CSR.pmpaddr15.set((start as u32 + size as u32) >> 2);
-                        }
-                        _ => break,
-                    }
-                }
-                None => {}
-            };
-        }
+        config.apply();
     }
 }

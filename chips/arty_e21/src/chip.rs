@@ -1,7 +1,9 @@
-use core::fmt::Write;
+use core::fmt::{Write, Display, Formatter};
 use kernel;
 use kernel::debug;
 use rv32i;
+use rv32i::csr::CSR;
+use rv32i::pmp::{RiscvMPU, RiscvMPUConfig, PMPRegion};
 
 use crate::gpio;
 use crate::interrupts;
@@ -12,8 +14,64 @@ extern "C" {
     fn _start_trap();
 }
 
+#[derive(Default)]
+pub struct E21MPUConfig {
+    regions: [PMPRegion; 4],
+    nregions: u8,
+    app_region: Option<(usize, usize)>,
+}
+
+impl RiscvMPUConfig for E21MPUConfig {
+    fn set_app_region(&mut self, addr: usize, size: usize) -> Option<()> {
+        if self.app_region.is_some() {
+            None
+        } else {
+            self.app_region = Some((addr, size));
+            Some(())
+        }
+    }
+
+    fn get_app_region(&self) -> Option<(usize, usize)> {
+        self.app_region
+    }
+
+    fn apply(&self) {
+        let mut cfgs = [0u32; 1];
+        let mut addrs = [0u32; 4];
+        self.render(&mut cfgs, &mut addrs);
+
+        CSR.pmpcfg0.set(cfgs[0]);
+        CSR.pmpaddr0.set(addrs[0]);
+        CSR.pmpaddr1.set(addrs[1]);
+        CSR.pmpaddr2.set(addrs[2]);
+        CSR.pmpaddr3.set(addrs[3]);
+    }
+
+    // From the DS: "The E2 PMP unit has 4 regions and a minimum granularity of 4 bytes"
+    fn max_regions() -> u8 {
+        4u8
+    }
+    fn granularity() -> usize {
+        4usize
+    }
+
+    fn state<'a>(&'a self) -> (&'a [PMPRegion], u8) {
+        (&self.regions, self.nregions)
+    }
+
+    fn state_mut<'a>(&'a mut self) -> (&'a mut [PMPRegion], &'a mut u8) {
+        (&mut self.regions, &mut self.nregions)
+    }
+}
+
+impl Display for E21MPUConfig {
+    fn fmt(&self, _f: &mut Formatter) -> core::fmt::Result {
+        Ok(())
+    }
+}
+
 pub struct ArtyExx {
-    pmp: rv32i::pmp::PMPConfig,
+    pmp: RiscvMPU<E21MPUConfig>,
     userspace_kernel_boundary: rv32i::syscall::SysCall,
     clic: rv32i::clic::Clic,
 }
@@ -26,7 +84,7 @@ impl ArtyExx {
         let in_use_interrupts: u64 = 0x1FFFF0080;
 
         ArtyExx {
-            pmp: rv32i::pmp::PMPConfig::new(4),
+            pmp: RiscvMPU::new(),
             userspace_kernel_boundary: rv32i::syscall::SysCall::new(),
             clic: rv32i::clic::Clic::new(in_use_interrupts),
         }
@@ -105,7 +163,7 @@ impl ArtyExx {
 }
 
 impl kernel::Chip for ArtyExx {
-    type MPU = rv32i::pmp::PMPConfig;
+    type MPU = RiscvMPU<E21MPUConfig>;
     type UserspaceKernelBoundary = rv32i::syscall::SysCall;
     type SysTick = ();
 

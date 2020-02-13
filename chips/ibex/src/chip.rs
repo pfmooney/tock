@@ -8,6 +8,7 @@ use kernel::common::registers::FieldValue;
 use kernel::debug;
 use rv32i::csr::{mcause, mie::mie, mip::mip, mtvec::mtvec, CSR};
 use rv32i::syscall::SysCall;
+use rv32i::pmp::{RiscvMPU, FullMPUConfig};
 
 use crate::gpio;
 use crate::interrupts;
@@ -19,14 +20,14 @@ pub const CHIP_FREQ: u32 = 50_000_000;
 
 pub struct Ibex {
     userspace_kernel_boundary: SysCall,
-    pmp: rv32i::pmp::PMPConfig,
+    mpu: RiscvMPU<FullMPUConfig>,
 }
 
 impl Ibex {
     pub unsafe fn new() -> Ibex {
         Ibex {
             userspace_kernel_boundary: SysCall::new(),
-            pmp: rv32i::pmp::PMPConfig::new(4),
+            mpu: RiscvMPU::new(),
         }
     }
 
@@ -54,12 +55,12 @@ impl Ibex {
 }
 
 impl kernel::Chip for Ibex {
-    type MPU = rv32i::pmp::PMPConfig;
+    type MPU = RiscvMPU<FullMPUConfig>;
     type UserspaceKernelBoundary = SysCall;
     type SysTick = ();
 
     fn mpu(&self) -> &Self::MPU {
-        &self.pmp
+        &self.mpu
     }
 
     fn systick(&self) -> &Self::SysTick {
